@@ -13,6 +13,7 @@
 #include <MSWSock.h>
 #include <urlmon.h>
 #include <atlstr.h>
+#include <wil/resource.h>
 
 #include "upnpPortOpener.h"
 
@@ -74,12 +75,10 @@ public:
 	void sendHttpFile(const std::filesystem::path& filename)
 	{
 		LONGLONG filesize = std::filesystem::file_size(filename);
-		auto fileHandle = CreateFileW(filename.native().c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+		wil::unique_handle fileHandle(CreateFileW(filename.native().c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL));
 
-		if (fileHandle == INVALID_HANDLE_VALUE) [[unlikely]]
-		{
+		if (!fileHandle) [[unlikely]]
 			throw std::system_error(GetLastError(), std::system_category(), "Error opening file");
-		}
 
 
 		sendString(
@@ -112,16 +111,13 @@ public:
 
 		do {
 			auto bytes = std::min(filesize - total_bytes.QuadPart, TRANSMITFILE_MAX);
-			if (TransmitFile(socket, fileHandle, bytes, 0, NULL, NULL, 0) == FALSE) {
-				CloseHandle(fileHandle);
+			if (TransmitFile(socket, fileHandle.get(), bytes, 0, NULL, NULL, 0) == FALSE) {
 				throw std::system_error(WSAGetLastError(), std::system_category(), "Error sending file");
 			}
 
 			total_bytes.QuadPart += bytes;
-			SetFilePointerEx(fileHandle, total_bytes, NULL, FILE_BEGIN);
+			SetFilePointerEx(fileHandle.get(), total_bytes, NULL, FILE_BEGIN);
 		} while (total_bytes.QuadPart < filesize);
-
-		CloseHandle(fileHandle);
 	}
 
 	std::string getLine()
@@ -289,7 +285,7 @@ void serveConnection(SOCKET&& s)
 
 		connection.sendHttpFile(filename);
 
-		std::cout << "File sent successfully. Terminating connection." << std::endl;
+		std::cout << "File sent successfully" << std::endl;
 	}
 	catch (const std::exception& e)
 	{
