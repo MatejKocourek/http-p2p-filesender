@@ -44,6 +44,22 @@ std::string ConvertLPCWSTRToString(LPCWSTR lpcwszStr)
 	return std::string(str.c_str());
 }
 
+template <char delimiter>
+static auto split(const std::string_view& str) {
+	std::vector<std::string_view> result;
+	size_t start = 0;
+	while (start <= str.size()) {
+		size_t end = str.find(delimiter, start);
+		if (end == std::string_view::npos) {
+			result.emplace_back(str.substr(start));
+			break;
+		}
+		result.emplace_back(str.substr(start, end - start));
+		start = end + 1;
+	}
+	return result;
+}
+
 class TcpConnection {
 	SOCKET socket;
 
@@ -72,52 +88,25 @@ public:
 		send(socket, string.data(), static_cast<int>(string.size()), 0);
 	}
 
-	void sendHttpFile(const std::filesystem::path& filename)
+	void sendHttpFile(const HANDLE& fileHandle, size_t size)
 	{
-		LONGLONG filesize = std::filesystem::file_size(filename);
-		wil::unique_handle fileHandle(CreateFileW(filename.native().c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL));
-
-		if (!fileHandle) [[unlikely]]
-			throw std::system_error(GetLastError(), std::system_category(), "Error opening file");
-
-
-		sendString(
-			"Connection: close\r\n"
-			"Cache-Control: no-store, no-transform\r\n"
-			"Content-Length: "
-		);
-
-		sendString(std::to_string(filesize));
-
-		{
-			LPWSTR pwzMimeOut = NULL;
-			HRESULT hr = FindMimeFromData(NULL, filename.native().c_str(), NULL, 0, NULL, FMFD_URLASFILENAME, &pwzMimeOut, 0);
-			if (hr == S_OK) {
-				sendString(
-					"\r\n"
-					"Content-Type: "
-				);
-				sendString(ConvertLPCWSTRToString(pwzMimeOut));
-			}
-		}
-
-		sendString(
-			"\r\n"
-			"\r\n"
-		);
-
-		LARGE_INTEGER total_bytes{ 0 };
-		total_bytes.QuadPart = 0;
+		size_t sent = 0;
 
 		do {
-			auto bytes = std::min(filesize - total_bytes.QuadPart, TRANSMITFILE_MAX);
-			if (TransmitFile(socket, fileHandle.get(), bytes, 0, NULL, NULL, 0) == FALSE) {
+			DWORD bytes = std::min(size - sent, static_cast<size_t>(TRANSMITFILE_MAX));
+
+			auto timeStart = std::chrono::system_clock::now();
+			if (TransmitFile(socket, fileHandle, bytes, 0, NULL, NULL, 0) == FALSE) {
 				throw std::system_error(WSAGetLastError(), std::system_category(), "Error sending file");
 			}
+			auto timeEnd = std::chrono::system_clock::now();
 
-			total_bytes.QuadPart += bytes;
-			SetFilePointerEx(fileHandle.get(), total_bytes, NULL, FILE_BEGIN);
-		} while (total_bytes.QuadPart < filesize);
+			double seconds = std::chrono::duration<double>(timeEnd - timeStart).count();
+
+			sent += bytes;
+
+			std::cerr << "Progress: " << (((double)sent) / size) * 100 << " %"". ""Average transmission speed: " << (bytes/seconds)/1000000 <<" MB/s." << std::endl;
+		} while (sent < size);
 	}
 
 	std::string getLine()
@@ -142,26 +131,23 @@ public:
 		throw std::system_error(WSAGetLastError(), std::system_category(), "Error receiving bytes");
 	}
 
+	std::string formatTime(const std::chrono::utc_clock::time_point& time)
+	{
+		auto seconds = std::chrono::time_point_cast<std::chrono::seconds>(time);
+		return std::format("{:%a, %d %b %Y %H:%M:%S} GMT", seconds);
+	}
+
 	void sendTime()
 	{
-		char buf[128];
-		time_t now = time(0);
-		struct tm tm;
-		gmtime_s(&tm, &now);
-		auto res = strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S", &tm);
-
-		if (res != 0) [[likely]]
-			{
-				sendString("Date: ");
-				sendString(buf);
-				sendString(" GMT\r\n");
-			}
+		sendString("Date: ");
+		sendString(formatTime(std::chrono::utc_clock::now()));
+		sendString("\r\n");
 	}
 
 private:
 	void ignoreAllInput()
 	{
-		char buf[1024];
+		char buf[4096];
 		while (true) {
 			auto numRead = recv(socket, buf, sizeof(buf), 0);
 			if (numRead == SOCKET_ERROR) [[unlikely]]
@@ -230,7 +216,7 @@ void serveConnection(SOCKET&& s)
 				"\r\n"
 			);
 
-			std::cout << "Method not allowed. Ignoring." << std::endl;
+			std::cerr << "Method not allowed. Ignoring." << std::endl;
 			return;
 		}
 		{
@@ -246,10 +232,10 @@ void serveConnection(SOCKET&& s)
 			{
 				DWORD fileNameSize = fileUnescaped.size();
 				if (UrlUnescapeW(&fileUnescaped[0], NULL, &fileNameSize, URL_UNESCAPE_INPLACE | URL_UNESCAPE_AS_UTF8) != S_OK) [[unlikely]]
-					{
-						std::cout << "Filename weird" << std::endl;
-						return;
-					}
+				{
+					std::cerr << "Filename weird" << std::endl;
+					return;
+				}
 			}
 
 			if (wcscmp(fileUnescaped.c_str(), filename.filename().c_str()) != 0)
@@ -264,28 +250,145 @@ void serveConnection(SOCKET&& s)
 					"\r\n"
 				);
 
-				std::cout << "Requested file not the same as hosted: " << word << std::endl;
+				std::cerr << "Requested file not the same as hosted: " << word << std::endl;
 				//std::cerr << "Hosted:" << filename.filename().string() << std::endl;
 
 				return;
 			}
 		}
+		LONGLONG filesize = std::filesystem::file_size(filename);
 
-		// Accept the whole request
-		while (!connection.getLine().empty()) {}
+		std::vector<std::pair<size_t, size_t>> ranges;
 
-		std::cout << "Sending the file..." << std::endl;
 
-		// Actual correct response
-		connection.sendString(
-			"HTTP/1.0 200 OK\r\n"
-		);
+		while (true)
+		{
+			std::string line = connection.getLine();
+
+			// Parse range
+			if (line.starts_with("Range: bytes="))
+			{
+				std::string_view rangeText(line);
+				rangeText = rangeText.substr(13);
+				auto rangesText = split<','>(rangeText);
+
+				ranges.reserve(rangesText.size());
+
+				for (const auto& rangeText : rangesText)
+				{
+					size_t start, end;
+
+					auto pos = rangeText.find_first_of('-');
+					start = std::atoll(rangeText.data());
+
+					if (pos + 1 >= rangeText.size())
+						end = filesize;
+					else
+						end = std::atoll(rangeText.data() + pos + 1);
+
+					ranges.emplace_back(start, end);
+				}
+			}
+
+			// TODO maybe add other headers that are relevant here
+
+			// Ignore everything else and stop after all is received
+			else if (line.empty())
+				break;
+		}
+
+
+		if (ranges.size() > 1)
+		{
+			std::cerr << "Client requests multipart ranges, this is not yet supported. Sending the full file" << std::endl;
+			ranges.clear();
+		}
+
+		bool partialContent = !ranges.empty();
+
+		if (partialContent)
+		{
+			// Actual correct response
+			connection.sendString(
+				"HTTP/1.0 206 Partial Content\r\n"
+			);
+			std::cerr << "Sending a part of the file (resuming download at " << (((double)ranges[0].first) / filesize)*100 << " %" << ")..." << std::endl;
+		}
+		else
+		{
+			// Actual correct response
+			connection.sendString(
+				"HTTP/1.0 200 OK\r\n"
+			);
+			std::cerr << "Sending the whole file..." << std::endl;
+		}
 
 		connection.sendTime();
 
-		connection.sendHttpFile(filename);
+		
+		wil::unique_handle fileHandle(CreateFileW(filename.native().c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL));
 
-		std::cout << "File sent successfully" << std::endl;
+		if (!fileHandle)// [[unlikely]]
+			throw std::system_error(GetLastError(), std::system_category(), "Error opening file");
+
+		if (ranges.empty())
+			ranges.emplace_back(0, filesize);
+
+
+		connection.sendString(
+			"Connection: close\r\n"
+			"Cache-Control: no-store, no-transform\r\n"
+			"Accept-Ranges: bytes\r\n"
+		);
+
+		connection.sendString("Last-Modified: ");
+		connection.sendString(connection.formatTime(std::chrono::utc_clock::from_sys(std::chrono::clock_cast<std::chrono::system_clock>(std::filesystem::last_write_time(filename)))));
+		connection.sendString("\r\n");
+
+
+		// TODO change to support multipart ranges
+		connection.sendString("Content-Length: ");
+		connection.sendString(std::to_string(ranges[0].second - ranges[0].first));
+		connection.sendString("\r\n");
+
+		std::string type;
+		{
+			LPWSTR pwzMimeOut = NULL;
+			HRESULT hr = FindMimeFromData(NULL, filename.native().c_str(), NULL, 0, NULL, FMFD_URLASFILENAME, &pwzMimeOut, 0);
+			
+			if (hr == S_OK) {
+				type = ConvertLPCWSTRToString(pwzMimeOut);
+			}
+		}
+
+		for (const auto& range : ranges)
+		{
+			connection.sendString("Content-Type: ");
+			connection.sendString(type);
+			connection.sendString("\r\n");
+
+			if (partialContent)
+			{
+				connection.sendString("Content-Range: bytes ");
+				connection.sendString(std::to_string(range.first));
+				connection.sendString("-");
+				connection.sendString(std::to_string(range.second));
+				connection.sendString("/");
+				connection.sendString(std::to_string(filesize));
+				connection.sendString("\r\n");
+			}
+
+			connection.sendString("\r\n");
+
+			// Set file pointer to requested position
+			LARGE_INTEGER start{ .QuadPart = (long long)range.first };
+			SetFilePointerEx(fileHandle.get(), start, NULL, FILE_BEGIN);
+
+			// Send the requested amount of bytes
+			connection.sendHttpFile(fileHandle.get(), range.second - range.first);
+		}
+
+		std::cerr << "File sent successfully" << std::endl;
 	}
 	catch (const std::exception& e)
 	{
@@ -368,7 +471,7 @@ int wmain(int argc, wchar_t* argv[])
 
     if (argc < 2) [[unlikely]]
     {
-        std::cout << "Missing file path argument" << std::endl;
+        std::cerr << "Missing file path argument" << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -378,7 +481,7 @@ int wmain(int argc, wchar_t* argv[])
 
 	if (!std::filesystem::is_regular_file(filename)) [[unlikely]]
 	{
-		std::cout << "File does not exist" << std::endl;
+		std::cerr << "File does not exist" << std::endl;
 		return EXIT_FAILURE;
 	}
 
@@ -404,7 +507,7 @@ int wmain(int argc, wchar_t* argv[])
 
 			if (returnCode == E_POINTER)
 			{
-				std::cout << "Filename too long" << std::endl;
+				std::cerr << "Filename too long" << std::endl;
 				return EXIT_FAILURE;
 			}
 			else if (returnCode != S_OK)
@@ -426,7 +529,7 @@ int wmain(int argc, wchar_t* argv[])
 	}
 	catch (const std::exception& e)
 	{
-		std::cout << e.what() << std::endl;
+		std::cerr << e.what() << std::endl;
 	}
 
 }
